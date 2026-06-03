@@ -58,7 +58,7 @@ pip install streamlit pandas numpy openpyxl
 
 **Run the Application:**
 ```bash
-cd /home/deveshjha/108-KPI
+cd /home/deveshjha/Downloads/108_KPI_Code
 streamlit run kpi_dashboard.py
 ```
 
