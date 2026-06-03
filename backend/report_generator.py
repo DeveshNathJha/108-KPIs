@@ -217,7 +217,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
         eq = eq[eq['Clean_Vehicle_No'].isin(hoto_vehicles)]
     
     # Sort by timestamp and keep LATEST audit per vehicle
-    if 'Timestamp' in eq.columns:
+    if not eq.empty and 'Timestamp' in eq.columns:
         eq['Timestamp'] = pd.to_datetime(eq['Timestamp'], errors='coerce')
         
         # Filter out audits that happened after the report period
@@ -227,10 +227,13 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
                 if pd.isna(ts):
                     return True
                 return ts.tz_localize(None) <= end_of_period
-            eq = eq[eq['Timestamp'].apply(is_valid_audit)]
             
-        eq = eq.sort_values('Timestamp').groupby('Clean_Vehicle_No').last().reset_index()
-    else:
+            mask = eq['Timestamp'].apply(is_valid_audit).astype(bool)
+            eq = eq[mask]
+            
+        if not eq.empty:
+            eq = eq.sort_values('Timestamp').groupby('Clean_Vehicle_No').last().reset_index()
+    elif not eq.empty:
         eq = eq.groupby('Clean_Vehicle_No').last().reset_index()
         
     eq_dict = eq.set_index('Clean_Vehicle_No').to_dict('index')
