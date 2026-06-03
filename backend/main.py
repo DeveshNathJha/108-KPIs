@@ -14,7 +14,7 @@ import pandas as pd
 import uvicorn
 import report_generator
 
-app = FastAPI(title="108 Emergency Ambulance Operations Hub", version="3.0")
+app = FastAPI(title="108 Ambulance KPI Analyzer", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +28,7 @@ app.add_middleware(
 async def generate_report(
     master_file: UploadFile = File(...),
     raw_file: UploadFile = File(...),
-    equipments_file: UploadFile = File(...),
+    equipments_file: UploadFile = File(None),
     calls_file: UploadFile = File(...),
     hoto_only: bool = False
 ):
@@ -36,7 +36,6 @@ async def generate_report(
         # Load sheets in memory
         master_bytes = await master_file.read()
         raw_bytes = await raw_file.read()
-        eq_bytes = await equipments_file.read()
         calls_bytes = await calls_file.read()
         
         def read_excel_smart(file_bytes, filename, candidates):
@@ -45,21 +44,29 @@ async def generate_report(
             try:
                 engine = 'openpyxl' if (filename and filename.lower().endswith('.xlsx')) else 'xlrd' if (filename and filename.lower().endswith('.xls')) else None
                 xl = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
-                for c in candidates:
-                    if c in xl.sheet_names:
-                        return xl.parse(c)
+                sheet_names = xl.sheet_names
+                for cand in candidates:
+                    cand_lower = cand.lower().strip()
+                    for name in sheet_names:
+                        if cand_lower in name.lower():
+                            return xl.parse(name)
                 return xl.parse(0)
-            except ValueError as ve:
+            except Exception as ve:
                 try:
                     return pd.read_csv(io.BytesIO(file_bytes))
                 except Exception:
                     raise ve
             
-        master_df = read_excel_smart(master_bytes, master_file.filename, ['Master Data', 'Master'])
-        raw_df = read_excel_smart(raw_bytes, raw_file.filename, ['1st to 14th May26 Raw Data', 'Raw Data', 'Raw Trips', 'Trips'])
-        eq_df = read_excel_smart(eq_bytes, equipments_file.filename, ['Equipments Data', 'Equipments', 'Equipment'])
-        calls_df = read_excel_smart(calls_bytes, calls_file.filename, ['01-05-2026 To 14-05-2026_CallHi', 'CallHits', 'Call Hits', 'Calls'])
+        master_df = read_excel_smart(master_bytes, master_file.filename, ['master'])
+        raw_df = read_excel_smart(raw_bytes, raw_file.filename, ['raw data', 'raw trips', 'trips', 'trip data'])
+        calls_df = read_excel_smart(calls_bytes, calls_file.filename, ['callhi', 'call hits', 'callhits', 'calls', 'call log', 'call'])
         
+        if equipments_file:
+            eq_bytes = await equipments_file.read()
+            eq_df = read_excel_smart(eq_bytes, equipments_file.filename, ['equipment', 'audit', 'response'])
+        else:
+            eq_df = pd.DataFrame()
+            
         excel_data, date_str = report_generator.generate_excel(master_df, raw_df, eq_df, calls_df, hoto_only=hoto_only)
         
         filename = f"KPI_Report_HOTO_Only{date_str}.xlsx" if hoto_only else f"KPI_Report{date_str}.xlsx"

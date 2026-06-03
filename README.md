@@ -9,20 +9,25 @@
 
 ## 1. Project Overview
 
-This dashboard monitors the **108 Emergency Ambulance Service** by automatically matching two separate operational data sources using a sophisticated SQL Correlation Engine:
+This system monitors the **108 Emergency Ambulance Service** by automatically integrating and correlating **four core operational registers** using a sophisticated in-memory SQL correlation pipeline:
 
-- **Call Hits File** — Records from the call center (every call that came in).
-- **Raw Data File** — Records from dispatch operations (every ambulance trip that was completed).
+1. **Call Hits Log (`Call Hits File`)** — Call center logs recording every call that came in.
+2. **Raw Trips Data (`Raw Data File`)** — Dispatch operations records showing completed ambulance trips with ODO readings, caller numbers, and times.
+3. **Master Data (`Master File`)** — The vehicle master registry listing active ambulance registrations, GPS installation status, operational status, vehicle type, and HOTO status.
+4. **Equipments Audit (`Equipments File`)** — Live equipment audit records (often collected via Google Forms) tracking medical inventory status (Working/Not Working/Not Available) per ambulance.
 
-The dashboard successfully solves the data-silo problem: determining which calls resulted in ambulance dispatches, and measuring end-to-end service quality.
+By bringing these four separate sources together, the system dynamically calculates vehicle-level performance metrics, daily call trends, and district-level operational health summaries while filtering for active HOTO fleets.
 
 ## 2. Architecture & File Structure
 
-The project has been refactored for speed and accuracy using an **In-Memory SQLite Engine**.
+The project has been architected for high-speed calculation using an **In-Memory SQLite Engine**.
 
-- **`kpi_dashboard.py`**: The Streamlit frontend. Handles file uploads, date/district filters, KPI scorecard generation, and UI components.
-- **`sql_engine.py`**: The backend correlation engine. When files are uploaded, this script loads the data into memory, normalizes the dates and string values, and executes a large SQLite query to perform phone number & time-proximity matching.
-- **`query.sql`**: A standalone SQL file. **This file is for documentation and review.** It contains the exact SQL logic used inside `sql_engine.py` but is separated out so you can read the logic with SQL syntax highlighting, comments, and structure. 
+- **`backend/main.py`**: The FastAPI server. Exposes the `/api/generate-report` endpoint to ingest all 4 files, orchestrate calculations, and serve the styled Excel output.
+- **`backend/static/index.html`**: A premium glassmorphism Web UI serving as the control hub for upload, processing, and download of HOTO and Full reports.
+- **`kpi_dashboard.py`**: A Streamlit frontend providing interactive dashboard charts, date filtering, and live scorecard metrics.
+- **`sql_engine.py`**: The core correlation engine. Executes high-speed probabilistic SQL matching (using phone + time proximity) inside an in-memory SQLite database.
+- **`backend/report_generator.py`**: The Excel report builder. Applies deep sanitization filters, calculates equipment health risk indices, and renders multiple dashboard sheets.
+- **`query.sql`**: A standalone SQL file containing the query blueprints for manual execution and review. 
 
 ## 3. The SQL Correlation Engine (v3 Fixes)
 
@@ -58,9 +63,11 @@ streamlit run kpi_dashboard.py
 ```
 
 **Data Upload Requirements:**
-You need two `.xlsx` files:
-1. **Raw Data** (Must contain: Date, Agrent CONNECTED TIME, scene_arrival_time, Location Type, DISEASE, District, CALLER NO, Vehicle No, Case ID)
-2. **Call Hits** (Must contain: Call Start Time, Agent Disposition, District, Phone Number)
+You upload four core files (in `.xlsx` or `.csv` format):
+1. **Master Data** (Must contain: `Registration No.` / `Registration No`, `GPS`, `HOTO Status` / `HOTO or not`, `Operational / Non-Operational`, `Type of Vehicle`)
+2. **Raw Trips Data** (Must contain: `Date`, `Agrent CONNECTED TIME`, `assigned_time`, `scene_arrival_time`, `Location Type`, `DISEASE`, `District` / `Distict`, `CALLER NO`, `Vehicle No`, `Case ID`, `Base Start ODO`, `Base End ODO`)
+3. **Equipments Audit** (Must contain: `VEHICLE NUMBER` and individual column headers for each standard medical equipment, e.g., `Cervical Collar`, `Pulse Oximeter`, `Suction Machine (Electric)`)
+4. **Call Hits Log** (Must contain: `Call Start Time`, `Agent Disposition` / `Dialer Disposition`, `District`, `Phone Number`, `Call Connect Time`, `Call End Time`, `QUEUE Duration`, `RING Duration`)
 
 ---
-*Last Updated: May 2026*
+*Last Updated: June 2026*

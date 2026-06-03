@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>108 Emergency Ambulance Operations Hub</title>
+    <title>108 Ambulance KPI Analyzer</title>
     <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -383,7 +383,7 @@
         <div class="logo-section">
             <i class="fa-solid fa-truck-medical logo-icon"></i>
             <div class="logo-text">
-                <h1>Ambulance Ops Hub</h1>
+                <h1>Ambulance KPI Analyzer</h1>
                 <p>108 Emergency Systems</p>
             </div>
         </div>
@@ -392,7 +392,7 @@
 
     <main>
         <section class="hero">
-            <h2>Operations Optimization Suite</h2>
+            <h2>Performance Analysis Dashboard</h2>
             <p>Compile district-wide operational metrics, check equipment health levels, and pivot daily metrics with integrated HOTO, GPS, and Operational statuses.</p>
         </section>
 
@@ -546,9 +546,17 @@
                 
                 const blob = await response.blob();
                 const url = window.URL.createObjectURL(blob);
+                const contentDisposition = response.headers.get('Content-Disposition');
+                let filename = hotoOnly ? 'KPI_Report_HOTO_Only.xlsx' : 'KPI_Report.xlsx';
+                if (contentDisposition) {
+                    const filenameMatch = contentDisposition.match(/filename="?([^";\s]+)"?/);
+                    if (filenameMatch && filenameMatch[1]) {
+                        filename = filenameMatch[1];
+                    }
+                }
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = hotoOnly ? 'KPI_Report_HOTO_Only.xlsx' : 'KPI_Report.xlsx';
+                a.download = filename;
                 document.body.appendChild(a);
                 a.click();
                 a.remove();

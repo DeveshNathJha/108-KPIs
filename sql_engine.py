@@ -150,49 +150,99 @@ def _parse_duration(series: pd.Series) -> pd.Series:
         )
     return res
 
+def _find_col(df: pd.DataFrame, candidates: list, default_series: pd.Series) -> pd.Series:
+    """Finds a column in df matching any candidate name case-insensitively,
+    standardizing spaces and underscores. If not found, returns default_series.
+    """
+    for c in df.columns:
+        c_clean = str(c).strip().lower().replace('_', ' ').replace('  ', ' ')
+        for cand in candidates:
+            cand_clean = str(cand).strip().lower().replace('_', ' ').replace('  ', ' ')
+            if cand_clean == c_clean:
+                return df[c]
+    return default_series
+
+def _parse_raw_datetime(df: pd.DataFrame, time_candidates: list, date_candidates: list, default_series: pd.Series) -> pd.Series:
+    time_series = _find_col(df, time_candidates, None)
+    if time_series is None or time_series.empty:
+        return default_series
+        
+    date_series = _find_col(df, date_candidates, None)
+    if date_series is None or date_series.empty or date_series.isna().all():
+        # Fallback if no date column is found
+        return pd.to_datetime(time_series, errors='coerce', format='mixed', dayfirst=False).dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+    d_str = pd.to_datetime(date_series, errors='coerce').dt.strftime('%Y-%m-%d')
+    
+    def _extract_time_str(x):
+        if pd.isna(x):
+            return '00:00:00'
+        if isinstance(x, str):
+            parts = x.strip().split()
+            t_part = parts[-1] if parts else '00:00:00'
+            if ':' in t_part:
+                return t_part
+            return '00:00:00'
+        if hasattr(x, 'strftime'):
+            return x.strftime('%H:%M:%S')
+        return '00:00:00'
+        
+    t_str = time_series.apply(_extract_time_str)
+    combined = d_str + ' ' + t_str
+    return pd.to_datetime(combined, errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
+
 def run_correlation(raw_df: pd.DataFrame, hits_df: pd.DataFrame) -> pd.DataFrame:
     # ── Pandas Preprocessing for Speed ──
     # Cleaned Tripps
     raw = pd.DataFrame()
-    raw['Trip_Clean_Phone'] = raw_df.get('CALLER NO', pd.Series()).astype(str).str.replace(' ', '', regex=False).str[-10:]
-    raw['Trip_Connected_Time'] = _fast_datetime_parse(raw_df.get('Agrent CONNECTED TIME', pd.Series()))
-    raw['Trip_Assigned_Time'] = _fast_datetime_parse(raw_df.get('assigned_time', pd.Series()))
-    raw['Scene_Arrival_Time'] = _fast_datetime_parse(raw_df.get('scene_arrival_time', pd.Series()))
-    raw['Case_ID'] = raw_df.get('Case ID', pd.Series()).astype(str)
-    raw['Disease'] = raw_df.get('DISEASE', pd.Series()).astype(str)
-    raw['Vehicle_No'] = raw_df.get('Vehicle No', pd.Series()).astype(str)
     
-    district = raw_df.get('District', raw_df.get('Distict', pd.Series())).astype(str).str.strip()
+    # Define fallback series of correct length
+    raw_default = pd.Series(index=raw_df.index)
+    hits_default = pd.Series(index=hits_df.index)
+    
+    raw['Trip_Clean_Phone'] = _find_col(raw_df, ['CALLER NO', 'Phone Number', 'Phone', 'Mobile'], raw_default).astype(str).str.replace(' ', '', regex=False).str[-10:]
+    raw['Trip_Connected_Time'] = _parse_raw_datetime(raw_df, ['Agrent CONNECTED TIME', 'Agent Connected Time', 'Connected Time', 'Connect Time'], ['Date', 'date'], raw_default)
+    raw['Trip_Assigned_Time'] = _parse_raw_datetime(raw_df, ['assigned_time', 'assigned time', 'assign time'], ['Date', 'date'], raw_default)
+    raw['Scene_Arrival_Time'] = _parse_raw_datetime(raw_df, ['scene_arrival_time', 'scene arrival time', 'scene arrival', 'arrival time'], ['Date', 'date'], raw_default)
+    raw['Case_ID'] = _find_col(raw_df, ['Case ID', 'Case No', 'Case Number'], raw_default).astype(str)
+    raw['Disease'] = _find_col(raw_df, ['DISEASE', 'disease', 'condition'], raw_default).astype(str)
+    raw['Vehicle_No'] = _find_col(raw_df, ['Vehicle No', 'Vehicle Number', 'Registration No', 'Registration Number'], raw_default).astype(str)
+    
+    district = _find_col(raw_df, ['District', 'Distict'], raw_default).astype(str).str.strip()
     raw['Trip_District'] = np.where(district.isin(['', '\\N', 'nan', 'NaN', 'None', 'NULL', 'Other', 'other', 'unknown']), 'Unknown', district)
     
-    loc_type = raw_df.get('Location Type', pd.Series()).astype(str)
+    loc_type = _find_col(raw_df, ['Location Type', 'Location Category', 'Location_Category', 'Area Type'], raw_default).astype(str)
     raw['Location_Category'] = np.where(loc_type.str.contains('Urban', na=False), 'Urban', 
                                np.where(loc_type.str.contains('Rural', na=False), 'Rural', 'Unknown'))
                                
     rt_sec = (pd.to_datetime(raw['Scene_Arrival_Time']) - pd.to_datetime(raw['Trip_Assigned_Time'])).dt.total_seconds()
-    raw['Response_Time_Mins'] = np.where(rt_sec < -43200, rt_sec + 86400, np.where(rt_sec < 0, 0, rt_sec)) / 60.0
+    # Correct for midnight crossovers
+    rt_sec = np.where(rt_sec < -43200, rt_sec + 86400, rt_sec)
+    # Floor small negative lag to 0, filter out large outliers (>300 mins or still negative) as np.nan
+    raw['Response_Time_Mins'] = np.where((rt_sec >= -60) & (rt_sec < 0), 0,
+                                np.where((rt_sec >= 0) & (rt_sec <= 18000), rt_sec / 60.0, np.nan))
     
     raw = raw.dropna(subset=['Trip_Connected_Time']).replace({'nan': None, 'NaT': None})
 
     # Cleaned Calls
     hits = pd.DataFrame()
     # 1. Extract ALL columns first before any dropna/sort
-    hits['Call_Start_Time_Raw'] = hits_df.get('Call Start Time', pd.Series())
-    hits['Clean_Phone'] = hits_df.get('Phone Number', pd.Series()).astype(str).str.replace(' ', '', regex=False).str[-10:]
+    hits['Call_Start_Time_Raw'] = _find_col(hits_df, ['Call Start Time', 'Start Time', 'Call Start'], hits_default)
+    hits['Clean_Phone'] = _find_col(hits_df, ['Phone Number', 'Phone', 'Mobile', 'CALLER NO'], hits_default).astype(str).str.replace(' ', '', regex=False).str[-10:]
     
-    q_dur = _parse_duration(hits_df.get('QUEUE Duration', pd.Series(index=hits_df.index)))
-    r_dur = _parse_duration(hits_df.get('RING Duration', pd.Series(index=hits_df.index)))
+    q_dur = _parse_duration(_find_col(hits_df, ['QUEUE Duration', 'QUEUE Time', 'Queue duration'], hits_default))
+    r_dur = _parse_duration(_find_col(hits_df, ['RING Duration', 'RING Time', 'Ring duration'], hits_default))
     hits['Call_Pickup_Time_Sec'] = q_dur + r_dur
 
-    _connect_raw = hits_df.get('Call Connect Time', pd.Series(index=hits_df.index))
-    _end_raw     = hits_df.get('Call End Time',     pd.Series(index=hits_df.index))
+    _connect_raw = _find_col(hits_df, ['Call Connect Time', 'Connect Time', 'Call Connect'], hits_default)
+    _end_raw     = _find_col(hits_df, ['Call End Time', 'End Time', 'Call End'], hits_default)
     _connect_ts  = pd.to_datetime(_connect_raw, errors='coerce', format='mixed', dayfirst=False)
     _end_ts      = pd.to_datetime(_end_raw,     errors='coerce', format='mixed', dayfirst=False)
     _aht_secs    = (_end_ts - _connect_ts).dt.total_seconds()
     hits['AHT_Secs'] = _aht_secs.where((_aht_secs > 0) & (_aht_secs < 7200), other=np.nan)
     
-    agent_disp = hits_df.get('Agent Disposition', pd.Series(index=hits_df.index)).astype(str).str.strip()
-    dialer_disp = hits_df.get('Dialer Disposition', pd.Series(index=hits_df.index)).astype(str).str.strip()
+    agent_disp = _find_col(hits_df, ['Agent Disposition', 'Agent_Disposition', 'Disposition'], hits_default).astype(str).str.strip()
+    dialer_disp = _find_col(hits_df, ['Dialer Disposition', 'Dialer_Disposition'], hits_default).astype(str).str.strip()
 
     def _normalize_disp(s: pd.Series) -> pd.Series:
         return s.str.replace(' ', '', regex=False).str.replace('-', '', regex=False)
@@ -207,7 +257,7 @@ def run_correlation(raw_df: pd.DataFrame, hits_df: pd.DataFrame) -> pd.DataFrame
         agent_disp_norm
     )
 
-    dist = hits_df.get('District', pd.Series(index=hits_df.index)).astype(str).str.strip()
+    dist = _find_col(hits_df, ['District', 'Distict'], hits_default).astype(str).str.strip()
     hits['Call_District'] = np.where(dist.isin(['', '\\N', 'nan', 'NaN', 'None', 'NULL', 'Other', 'other', 'unknown']), 'Unknown', dist)
 
     eligible_vals = {
