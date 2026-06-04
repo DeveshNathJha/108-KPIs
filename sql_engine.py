@@ -175,21 +175,21 @@ def _parse_raw_datetime(df: pd.DataFrame, time_candidates: list, date_candidates
     d_str = pd.to_datetime(date_series, errors='coerce').dt.strftime('%Y-%m-%d')
     
     def _extract_time_str(x):
-        if pd.isna(x):
-            return '00:00:00'
+        if pd.isna(x) or str(x).strip() in ('', 'nan', 'None', '\\N', 'N/A'):
+            return None
         if isinstance(x, str):
             parts = x.strip().split()
-            t_part = parts[-1] if parts else '00:00:00'
+            t_part = parts[-1] if parts else ''
             if ':' in t_part:
                 return t_part
-            return '00:00:00'
+            return None
         if hasattr(x, 'strftime'):
             return x.strftime('%H:%M:%S')
-        return '00:00:00'
+        return None
         
     t_str = time_series.apply(_extract_time_str)
-    combined = d_str + ' ' + t_str
-    return pd.to_datetime(combined, errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S')
+    combined = np.where(t_str.isna() | pd.isna(d_str), None, d_str + ' ' + t_str)
+    return pd.Series(pd.to_datetime(combined, errors='coerce'), index=df.index).dt.strftime('%Y-%m-%d %H:%M:%S')
 
 def run_correlation(raw_df: pd.DataFrame, hits_df: pd.DataFrame) -> pd.DataFrame:
     # ── Pandas Preprocessing for Speed ──
