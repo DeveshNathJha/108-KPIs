@@ -75,7 +75,8 @@ def clean_vehicle_number(val):
     clean = re.sub(r'[^A-Z0-9]', '', s)
     if clean in ('N', 'NAN', 'NONE', 'NULL', 'NA') or len(clean) < 4:
         return ""
-    return TYPO_CORRECTIONS.get(clean, clean)
+    clean_short = clean[:10]
+    return TYPO_CORRECTIONS.get(clean_short, clean_short)
 
 def format_hoto_status(val, max_date=None):
     if pd.isna(val):
@@ -93,7 +94,7 @@ def format_hoto_status(val, max_date=None):
     if val_str.upper() in ('YES', 'Y', 'HOTO', 'TRUE'):
         return 'YES'
     try:
-        dt = pd.to_datetime(val_str, errors='coerce')
+        dt = pd.to_datetime(val_str, errors='coerce', dayfirst=True)
         if pd.notna(dt):
             dt_naive = pd.Timestamp(dt).tz_localize(None)
             if max_date is not None:
@@ -120,7 +121,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     original_master_count = len(master_df)
     
     # Pre-calculate dates for HOTO filtering
-    temp_raw_dates = pd.to_datetime(raw_df['Date'], errors='coerce') if 'Date' in raw_df.columns else pd.Series(dtype='datetime64[ns]')
+    temp_raw_dates = pd.to_datetime(raw_df['Date'], errors='coerce', dayfirst=True) if 'Date' in raw_df.columns else pd.Series(dtype='datetime64[ns]')
     max_date = temp_raw_dates.max()
     min_date = temp_raw_dates.min()
     
@@ -148,7 +149,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
                 if pd.isna(val) or str(val).strip() in ('', '-----', 'nan', 'None'):
                     return False
                 try:
-                    dt = pd.to_datetime(str(val).strip(), errors='coerce')
+                    dt = pd.to_datetime(str(val).strip(), errors='coerce', dayfirst=True)
                     if pd.notna(dt):
                         return min_dt > dt.tz_localize(None)
                 except Exception:
@@ -193,7 +194,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
                 is_hoto = True
                 try:
                     # Attempt to parse the HOTO date
-                    hoto_dt = pd.to_datetime(row.get(hoto_col if hoto_col else 'HOTO Status'), errors='coerce')
+                    hoto_dt = pd.to_datetime(row.get(hoto_col if hoto_col else 'HOTO Status'), errors='coerce', dayfirst=True)
                     # If we successfully parse the date and max_date is available, check if HOTO happened after report period
                     if pd.notna(hoto_dt) and pd.notna(max_date):
                         # Make both naive for comparison
@@ -236,7 +237,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     
     # Sort by timestamp and keep LATEST audit per vehicle
     if not eq.empty and 'Timestamp' in eq.columns:
-        eq['Timestamp'] = pd.to_datetime(eq['Timestamp'], errors='coerce')
+        eq['Timestamp'] = pd.to_datetime(eq['Timestamp'], errors='coerce', dayfirst=True)
         
         # Filter out audits that happened after the report period
         if pd.notna(max_date):
@@ -264,7 +265,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     raw['Clean_Vehicle_No'] = raw['Vehicle No'].apply(clean_vehicle_number)
     
     # Date Range of dataset (already calculated above, just re-assigning for raw_df)
-    raw['Parsed_Date'] = pd.to_datetime(raw['Date'], errors='coerce')
+    raw['Parsed_Date'] = pd.to_datetime(raw['Date'], errors='coerce', dayfirst=True)
     all_dates = pd.date_range(start=min_date, end=max_date) if pd.notna(min_date) and pd.notna(max_date) else []
     total_days = max(len(all_dates), 1)
     
@@ -277,8 +278,8 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     parsed_assigned = sql_engine._parse_raw_datetime(raw, ['assigned_time', 'assigned time', 'assign time'], ['Date', 'date'], raw_default)
     parsed_connected = sql_engine._parse_raw_datetime(raw, ['Agrent CONNECTED TIME', 'Agent Connected Time', 'Connected Time', 'Connect Time'], ['Date', 'date'], raw_default)
     
-    dispatch_sec = (pd.to_datetime(parsed_assigned, errors='coerce') - 
-                    pd.to_datetime(parsed_connected, errors='coerce')).dt.total_seconds()
+    dispatch_sec = (pd.to_datetime(parsed_assigned, errors='coerce', dayfirst=True) - 
+                    pd.to_datetime(parsed_connected, errors='coerce', dayfirst=True)).dt.total_seconds()
     # Correct for midnight crossovers
     dispatch_sec = np.where(dispatch_sec < -43200, dispatch_sec + 86400, dispatch_sec)
     # Floor small negative lag to 0, filter out large outliers (>3 hours or still negative) as np.nan
@@ -382,7 +383,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
             condemn_val = row.get(condemn_col)
             if pd.notna(condemn_val) and str(condemn_val).strip() not in ('', '-----', 'nan', 'None'):
                 try:
-                    condemn_dt = pd.to_datetime(str(condemn_val).strip(), errors='coerce')
+                    condemn_dt = pd.to_datetime(str(condemn_val).strip(), errors='coerce', dayfirst=True)
                     if pd.notna(condemn_dt) and pd.notna(max_date):
                         if max_date.tz_localize(None) >= condemn_dt.tz_localize(None):
                             op_status = 'Non-Operational'
@@ -446,7 +447,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
                 is_hoto = True
             elif str(hoto_val).strip().upper() not in ('', 'NAN', 'NAT', 'NONE', 'NO', 'N/A', 'FALSE', 'N'):
                 try:
-                    hoto_dt = pd.to_datetime(hoto_val, errors='coerce')
+                    hoto_dt = pd.to_datetime(hoto_val, errors='coerce', dayfirst=True)
                     if pd.notna(hoto_dt):
                         is_hoto = True
                 except Exception:
@@ -464,7 +465,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
                 condemn_val = row.get(condemn_col)
                 if pd.notna(condemn_val) and str(condemn_val).strip() not in ('', '-----', 'nan', 'None'):
                     try:
-                        condemn_dt = pd.to_datetime(str(condemn_val).strip(), errors='coerce')
+                        condemn_dt = pd.to_datetime(str(condemn_val).strip(), errors='coerce', dayfirst=True)
                         if pd.notna(condemn_dt):
                             if condemn_dt.tz_localize(None) <= date_tz_none:
                                 continue # Already retired on this date
@@ -679,17 +680,16 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
         
     gps_total = 0
     if 'GPS' in master_df.columns:
-        gps_total = master_df['GPS'].astype(str).str.upper().str.strip().isin(['YES', 'Y']).sum()
+        hoto_mask = master_df.apply(check_hoto_row, axis=1) if not master_df.empty else pd.Series(dtype=bool)
+        gps_total = master_df[hoto_mask]['GPS'].astype(str).str.upper().str.strip().isin(['YES', 'Y']).sum()
     gps_pct = f"{round((gps_total / max(total_fleet, 1) * 100), 1)}% ({gps_total}/{total_fleet})" if total_fleet > 0 else "N/A"
     
     summary_rows = [
         {"KPI Report Parameter": "Summary Report", "Value / Metric": ""},
-        {"KPI Report Parameter": "----------------------------------------", "Value / Metric": "----------------------------------------"},
         {"KPI Report Parameter": "Report Generation Time", "Value / Metric": report_gen_date},
         {"KPI Report Parameter": "Reporting Date Range", "Value / Metric": period_str},
         {"KPI Report Parameter": "", "Value / Metric": ""},
         {"KPI Report Parameter": "Operational Statistics Summary", "Value / Metric": ""},
-        {"KPI Report Parameter": "----------------------------------------", "Value / Metric": "----------------------------------------"},
         {"KPI Report Parameter": "Total Vehicles in Master Database", "Value / Metric": original_master_count},
         {"KPI Report Parameter": "Registered Handed Over Fleet (HOTO)", "Value / Metric": total_fleet},
         {"KPI Report Parameter": "Active Fleet Size (Ambulances with trips)", "Value / Metric": active_fleet},
@@ -697,21 +697,18 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
         {"KPI Report Parameter": "Total Operational Distance Travelled (Km)", "Value / Metric": round(total_dist, 1)},
         {"KPI Report Parameter": "", "Value / Metric": ""},
         {"KPI Report Parameter": "Performance & SLA Compliance", "Value / Metric": ""},
-        {"KPI Report Parameter": "----------------------------------------", "Value / Metric": "----------------------------------------"},
         {"KPI Report Parameter": "Average Response Time (Mins)", "Value / Metric": round(avg_response_time, 2) if pd.notna(avg_response_time) else "N/A"},
         {"KPI Report Parameter": "Urban ART Compliance (<=25 mins)", "Value / Metric": urban_art_pct},
         {"KPI Report Parameter": "Rural ART Compliance (<=40 mins)", "Value / Metric": rural_art_pct},
         {"KPI Report Parameter": "Ambulance Dispatch Compliance (<=180s)", "Value / Metric": dispatch_sla_pct},
         {"KPI Report Parameter": "", "Value / Metric": ""},
         {"KPI Report Parameter": "SLA & Operational Insights", "Value / Metric": ""},
-        {"KPI Report Parameter": "----------------------------------------", "Value / Metric": "----------------------------------------"},
         {"KPI Report Parameter": "Total Days with Operational fleet < 95%", "Value / Metric": (daily_df['Operational fleet < 95%'] == 'YES').sum() if not daily_df.empty else 0},
         {"KPI Report Parameter": "Total Fleet Delay in response time (Mins)", "Value / Metric": round(amb_df['Total Delay in response time'].sum(), 1) if not amb_df.empty else 0},
         {"KPI Report Parameter": "Districts with Shortfall in Trips", "Value / Metric": (dist_df['Excess / Shortfall Status'].str.contains('Shortfall in Trips', na=False)).sum() if not dist_df.empty else 0},
         {"KPI Report Parameter": "Districts with Shortfall in Distance", "Value / Metric": (dist_df['Excess / Shortfall Status'].str.contains('Shortfall in Distance', na=False)).sum() if not dist_df.empty else 0},
         {"KPI Report Parameter": "", "Value / Metric": ""},
         {"KPI Report Parameter": "Equipment Quality & Asset Audits", "Value / Metric": ""},
-        {"KPI Report Parameter": "----------------------------------------", "Value / Metric": "----------------------------------------"},
         {"KPI Report Parameter": "Total Equipments Audited Vehicles", "Value / Metric": eq_audited_count},
         {"KPI Report Parameter": "Equipment Quality Adherence (Health >= 90%)", "Value / Metric": eq_adherence_pct},
         {"KPI Report Parameter": "High-Risk Ambulances (Equipment health < 70%)", "Value / Metric": high_risk_count},

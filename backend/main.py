@@ -14,7 +14,7 @@ import pandas as pd
 import uvicorn
 import report_generator
 
-app = FastAPI(title="108 Ambulance KPI Analyzer", version="3.0")
+app = FastAPI(title="108 Ambulance KPI Analyzer")
 
 app.add_middleware(
     CORSMiddleware,
