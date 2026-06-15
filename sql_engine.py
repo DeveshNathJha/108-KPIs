@@ -4,43 +4,57 @@ sql_engine.py  (v6 — Datetime Fix & Disposition Normalization)
 108 Ambulance KPI — SQL Correlation Engine
 
 Key fix (v6): Both data files use M/D/YYYY (US/ISO) format.
-  dayfirst=True was treating Apr-01 as Jan-04, completely breaking
-  the time-window join and producing near-zero served-call counts.
+# dayfirst=True was treating Apr-01 as Jan-04, completely broken.
 """
-
-import sqlite3
-import warnings
 import pandas as pd
 import numpy as np
-
+import sqlite3
+import re
 _CORRELATION_SQL = """
--- STEP 3: PROBABILISTIC CORRELATION (TIME + PHONE)
+-- STEP 3: DUAL-KEY CORRELATION (VEHICLE NO primary + PHONE fallback)
 WITH PotentialMatches AS (
     SELECT
         c.*,
-        t.Trip_Connected_Time,
-        t.Scene_Arrival_Time,
-        t.Case_ID,
-        t.Disease,
-        t.Vehicle_No,
-        t.Trip_District,
-        t.Location_Category,
-        t.Response_Time_Mins, 
-        ((JULIANDAY(t.Trip_Connected_Time) - JULIANDAY(c.Call_Start_Time)) * 1440) AS Time_Gap_Mins,
-        ABS((JULIANDAY(t.Trip_Connected_Time) - JULIANDAY(c.Call_Start_Time)) * 1440) AS Abs_Time_Gap_Mins
-        
+        c.Call_Connect_Time AS Trip_Connected_Time,
+        COALESCE(t_veh.Scene_Arrival_Time, t_phone.Scene_Arrival_Time) AS Scene_Arrival_Time,
+        COALESCE(t_veh.Case_ID, t_phone.Case_ID) AS Case_ID,
+        COALESCE(t_veh.Disease, t_phone.Disease) AS Disease,
+        COALESCE(t_veh.Vehicle_No, t_phone.Vehicle_No) AS Vehicle_No,
+        COALESCE(t_veh.Trip_District, t_phone.Trip_District) AS Trip_District,
+        COALESCE(t_veh.Location_Category, t_phone.Location_Category) AS Location_Category,
+        ((JULIANDAY(COALESCE(t_veh.Scene_Arrival_Time, t_phone.Scene_Arrival_Time)) - JULIANDAY(c.Call_Connect_Time)) * 1440) AS Response_Time_Mins,
+
+        ((JULIANDAY(COALESCE(t_veh.Trip_Connected_Time, t_phone.Trip_Connected_Time)) - JULIANDAY(c.Call_Start_Time)) * 1440) AS Time_Gap_Mins,
+        ABS((JULIANDAY(COALESCE(t_veh.Trip_Connected_Time, t_phone.Trip_Connected_Time)) - JULIANDAY(c.Call_Start_Time)) * 1440) AS Abs_Time_Gap_Mins,
+
+        CASE
+            WHEN t_veh.Case_ID IS NOT NULL THEN 1
+            ELSE 2
+        END AS Match_Type
+
     FROM CleanedCalls c
-    LEFT JOIN CleanedTrips t ON c.Clean_Phone = t.Trip_Clean_Phone
-    AND ABS((JULIANDAY(t.Trip_Connected_Time) - JULIANDAY(c.Call_Start_Time)) * 1440) <= 90
+    LEFT JOIN CleanedTrips t_veh ON (
+        c.Call_Vehicle_No != ''
+        AND c.Call_Vehicle_No = t_veh.Clean_Vehicle_No
+        AND t_veh.Trip_Connected_Time >= datetime(c.Call_Start_Time, '-90 minutes')
+        AND t_veh.Trip_Connected_Time <= datetime(c.Call_Start_Time, '+90 minutes')
+    )
+    LEFT JOIN CleanedTrips t_phone ON (
+        c.Call_Vehicle_No = ''
+        AND c.Clean_Phone = t_phone.Trip_Clean_Phone
+        AND t_phone.Trip_Connected_Time >= datetime(c.Call_Start_Time, '-90 minutes')
+        AND t_phone.Trip_Connected_Time <= datetime(c.Call_Start_Time, '+90 minutes')
+    )
 ),
 
 -- STEP 4: BEST-MATCH SELECTION (TRIP-CENTRIC)
+-- Vehicle matches win over phone matches; then prefer smallest time gap
 BestCallForTrip AS (
     SELECT
         *,
         ROW_NUMBER() OVER (
             PARTITION BY Case_ID
-            ORDER BY Abs_Time_Gap_Mins ASC
+            ORDER BY Match_Type ASC, Call_Start_Time ASC
         ) AS Trip_Rank,
         COUNT(Case_ID) OVER (
             PARTITION BY Call_ID
@@ -57,26 +71,27 @@ ServedTrips AS (
 CorrelatedCalls AS (
     SELECT
         c.Call_ID, 
-        c.Call_Start_Time, 
-        c.Clean_Phone, 
+        c.Call_Start_Time,
+        c.Clean_Phone,
         c.Final_Disposition                                            AS Agent_Disposition,
         COALESCE(t.Trip_District, c.Call_District)                     AS Final_District,
-        c.Call_District, 
-        c.Is_Eligible, 
+        c.Call_District,
+        c.Is_Eligible,
         c.Call_Pickup_Time_Sec,
         c.AHT_Secs,
         c.Call_Seq_Per_Phone,
         c.Total_Calls_From_Phone,
         COALESCE(t.Candidate_Match_Count, 0)                           AS Candidate_Match_Count,
-        
-        t.Case_ID, 
-        t.Trip_Connected_Time, 
+
+        t.Case_ID,
+        t.Trip_Connected_Time,
         t.Scene_Arrival_Time,
         t.Disease, t.Vehicle_No, t.Trip_District, t.Location_Category,
-        t.Response_Time_Mins, 
+        t.Response_Time_Mins,
         t.Abs_Time_Gap_Mins,
         t.Time_Gap_Mins,
-        
+        t.Match_Type,
+
         CASE WHEN t.Case_ID IS NOT NULL THEN 'Served' ELSE 'Not Served' END AS Service_Status,
 
         CASE
@@ -124,6 +139,7 @@ CorrelatedCalls AS (
 )
 
 SELECT * FROM CorrelatedCalls
+
 """
 
 def _fast_datetime_parse(series: pd.Series) -> pd.Series:
@@ -136,18 +152,14 @@ def _fast_datetime_parse(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors='coerce', format='mixed', dayfirst=False).dt.strftime('%Y-%m-%d %H:%M:%S')
 
 def _parse_duration(series: pd.Series) -> pd.Series:
-    """Fast conversion of HH:MM:SS to seconds."""
+    """Fast conversion of H:MM:SS or HH:MM:SS to seconds."""
     s = series.astype(str).str.strip()
-    mask = s.str.match(r'^\d{2}:\d{2}:\d{2}$')
+    mask = s.str.match(r'^\d{1,2}:\d{2}:\d{2}$')
     
     res = pd.Series(0.0, index=series.index)
     if mask.any():
-        valid = s[mask]
-        res[mask] = (
-            valid.str.slice(0, 2).astype(float) * 3600 +
-            valid.str.slice(3, 5).astype(float) * 60 +
-            valid.str.slice(6, 8).astype(float)
-        )
+        valid = s[mask].str.split(':', expand=True).astype(float)
+        res[mask] = valid[0] * 3600 + valid[1] * 60 + valid[2]
     return res
 
 def _find_col(df: pd.DataFrame, candidates: list, default_series: pd.Series) -> pd.Series:
@@ -172,7 +184,9 @@ def _parse_raw_datetime(df: pd.DataFrame, time_candidates: list, date_candidates
         # Fallback if no date column is found
         return pd.to_datetime(time_series, errors='coerce', format='mixed', dayfirst=False).dt.strftime('%Y-%m-%d %H:%M:%S')
         
-    d_str = pd.to_datetime(date_series, errors='coerce').dt.strftime('%Y-%m-%d')
+    # Raw Data 'Date' column is in M/D/YYYY format (e.g., 3/1/2026 = March 1).
+    # Must use dayfirst=False here, to match the calls file format.
+    d_str = pd.to_datetime(date_series, errors='coerce', dayfirst=False).dt.strftime('%Y-%m-%d')
     
     def _extract_time_str(x):
         if pd.isna(x) or str(x).strip() in ('', 'nan', 'None', '\\N', 'N/A'):
@@ -204,18 +218,42 @@ def run_correlation(raw_df: pd.DataFrame, hits_df: pd.DataFrame) -> pd.DataFrame
     raw['Trip_Connected_Time'] = _parse_raw_datetime(raw_df, ['Agrent CONNECTED TIME', 'Agent Connected Time', 'Connected Time', 'Connect Time'], ['Date', 'date'], raw_default)
     raw['Trip_Assigned_Time'] = _parse_raw_datetime(raw_df, ['assigned_time', 'assigned time', 'assign time'], ['Date', 'date'], raw_default)
     raw['Scene_Arrival_Time'] = _parse_raw_datetime(raw_df, ['scene_arrival_time', 'scene arrival time', 'scene arrival', 'arrival time'], ['Date', 'date'], raw_default)
-    raw['Case_ID'] = _find_col(raw_df, ['Case ID', 'Case No', 'Case Number'], raw_default).astype(str)
+    
+    # Sanitize '00-00-0000 00:00:00' junk values → treat as NaT
+    for col in ['Trip_Connected_Time', 'Trip_Assigned_Time', 'Scene_Arrival_Time']:
+        raw[col] = raw[col].where(
+            ~raw[col].astype(str).str.contains('0000-00-00|00-00-0000', na=False),
+            other=None
+        )
+    # IMPORTANT: Case ID in the raw CSV is '20260000000000' for ALL EMG/IFT trips
+    # (they all share the same value from the year-prefix generic ID).
+    # Using it as a trip key causes only 1 match ever. Use row index instead.
+    sl_no = _find_col(raw_df, ['Sl No', 'Sl.No', 'Serial No', 'Sr No', 'SNo', 'S No'], raw_default)
+    if sl_no is not None and not sl_no.isna().all():
+        raw['Case_ID'] = sl_no.astype(str)
+    else:
+        raw['Case_ID'] = [str(i) for i in range(len(raw_df))]  # fallback: row index
+
     raw['Disease'] = _find_col(raw_df, ['DISEASE', 'disease', 'condition'], raw_default).astype(str)
     raw['Vehicle_No'] = _find_col(raw_df, ['Vehicle No', 'Vehicle Number', 'Registration No', 'Registration Number'], raw_default).astype(str)
+    # Clean vehicle number for SQL join (strip spaces, uppercase, remove non-alphanum)
+    raw['Clean_Vehicle_No'] = raw['Vehicle_No'].apply(
+        lambda x: re.sub(r'[^A-Z0-9]', '', str(x).strip().upper())[:10]
+        if str(x).strip().upper() not in ('', 'NAN', 'NONE', '\\N', 'NULL', 'NA') else ''
+    )
     
     district = _find_col(raw_df, ['District', 'Distict'], raw_default).astype(str).str.strip()
-    raw['Trip_District'] = np.where(district.isin(['', '\\N', 'nan', 'NaN', 'None', 'NULL', 'Other', 'other', 'unknown']), 'Unknown', district)
+    # Normalize Seraikela Kharsawan to SARAIKELA to match Master sheet
+    district_normalized = pd.Series(np.where(district.str.upper().str.contains('SERAIKELA|SARAIKELA', na=False), 'SARAIKELA', district), index=raw_df.index)
+    raw['Trip_District'] = np.where(district_normalized.isin(['', '\\N', 'nan', 'NaN', 'None', 'NULL', 'Other', 'other', 'unknown']), 'Unknown', district_normalized)
     
     loc_type = _find_col(raw_df, ['Location Type', 'Location Category', 'Location_Category', 'Area Type'], raw_default).astype(str)
     raw['Location_Category'] = np.where(loc_type.str.contains('Urban', na=False), 'Urban', 
                                np.where(loc_type.str.contains('Rural', na=False), 'Rural', 'Unknown'))
                                
-    rt_sec = (pd.to_datetime(raw['Scene_Arrival_Time']) - pd.to_datetime(raw['Trip_Assigned_Time'])).dt.total_seconds()
+    # Response Time = scene_arrival_time - Agent CONNECTED TIME (agent picked up the call)
+    # Note: column name in CSV is 'Agrent CONNECTED TIME' (typo in source data, preserved as-is)
+    rt_sec = (pd.to_datetime(raw['Scene_Arrival_Time']) - pd.to_datetime(raw['Trip_Connected_Time'])).dt.total_seconds()
     # Correct for midnight crossovers
     rt_sec = np.where(rt_sec < -43200, rt_sec + 86400, rt_sec)
     # Floor small negative lag to 0, filter out large outliers (>300 mins or still negative) as np.nan
@@ -240,6 +278,8 @@ def run_correlation(raw_df: pd.DataFrame, hits_df: pd.DataFrame) -> pd.DataFrame
     _end_ts      = pd.to_datetime(_end_raw,     errors='coerce', format='mixed', dayfirst=False)
     _aht_secs    = (_end_ts - _connect_ts).dt.total_seconds()
     hits['AHT_Secs'] = _aht_secs.where((_aht_secs > 0) & (_aht_secs < 7200), other=np.nan)
+    hits['Call_Connect_Time'] = pd.to_datetime(_connect_raw, errors='coerce', format='mixed', dayfirst=False).dt.strftime('%Y-%m-%d %H:%M:%S')
+    hits['Call_End_Time'] = pd.to_datetime(_end_raw, errors='coerce', format='mixed', dayfirst=False).dt.strftime('%Y-%m-%d %H:%M:%S')
     
     agent_disp = _find_col(hits_df, ['Agent Disposition', 'Agent_Disposition', 'Disposition'], hits_default).astype(str).str.strip()
     dialer_disp = _find_col(hits_df, ['Dialer Disposition', 'Dialer_Disposition'], hits_default).astype(str).str.strip()
@@ -258,7 +298,17 @@ def run_correlation(raw_df: pd.DataFrame, hits_df: pd.DataFrame) -> pd.DataFrame
     )
 
     dist = _find_col(hits_df, ['District', 'Distict'], hits_default).astype(str).str.strip()
-    hits['Call_District'] = np.where(dist.isin(['', '\\N', 'nan', 'NaN', 'None', 'NULL', 'Other', 'other', 'unknown']), 'Unknown', dist)
+    # Normalize Seraikela Kharsawan to SARAIKELA to match Master sheet
+    dist_normalized = pd.Series(np.where(dist.str.upper().str.contains('SERAIKELA|SARAIKELA', na=False), 'SARAIKELA', dist), index=hits_df.index)
+    hits['Call_District'] = np.where(dist_normalized.isin(['', '\\N', 'nan', 'NaN', 'None', 'NULL', 'Other', 'other', 'unknown']), 'Unknown', dist_normalized)
+
+    # Extract Vehicle No. from calls — the primary correlation key
+    # calls 'Vehicle No.' records which ambulance handled the call directly
+    call_veh_raw = _find_col(hits_df, ['Vehicle No.', 'Vehicle No', 'Vehicle Number'], hits_default).astype(str)
+    hits['Call_Vehicle_No'] = call_veh_raw.apply(
+        lambda x: re.sub(r'[^A-Z0-9]', '', str(x).strip().upper())[:10]
+        if str(x).strip().upper() not in ('', 'NAN', 'NONE', '\\N', 'NULL', 'NA') else ''
+    )
 
     eligible_vals = {
         'EmergencyCall', 'InterFacilityTransfer', 'NonEmergencyCall',
@@ -295,13 +345,47 @@ def run_correlation(raw_df: pd.DataFrame, hits_df: pd.DataFrame) -> pd.DataFrame
         hits.to_sql('CleanedCalls', conn, index=False, if_exists='replace')
         
         # Build indexes
-        conn.execute("CREATE INDEX idx_raw_phone ON CleanedTrips(Trip_Clean_Phone)")
+        conn.execute("CREATE INDEX idx_raw_veh_time ON CleanedTrips(Clean_Vehicle_No, Trip_Connected_Time)")
+        conn.execute("CREATE INDEX idx_raw_phone_time ON CleanedTrips(Trip_Clean_Phone, Trip_Connected_Time)")
+        conn.execute("CREATE INDEX idx_hits_veh ON CleanedCalls(Call_Vehicle_No)")
         conn.execute("CREATE INDEX idx_hits_phone ON CleanedCalls(Clean_Phone)")
-        conn.execute("CREATE INDEX idx_raw_time ON CleanedTrips(Trip_Connected_Time)")
         conn.execute("CREATE INDEX idx_hits_time ON CleanedCalls(Call_Start_Time)")
         
         result = pd.read_sql_query(_CORRELATION_SQL, conn)
     finally:
         conn.close()
+
+    # Recalculate true Response_Time_Mins and SLA/ART compliance flags in Python to handle crossovers and lag floorings
+    arr_ts = pd.to_datetime(result['Scene_Arrival_Time'], errors='coerce')
+    conn_ts = pd.to_datetime(result['Trip_Connected_Time'], errors='coerce') # which is c.Call_Connect_Time in our SQL
+    
+    rt_sec = (arr_ts - conn_ts).dt.total_seconds()
+    # Correct for midnight crossovers
+    rt_sec_corrected = np.where(rt_sec < -43200, rt_sec + 86400, rt_sec)
+    # Floor small negative lag (up to 1 min) to 0, filter out large outliers (>300 mins) as np.nan
+    rt_mins = np.where((rt_sec_corrected >= -60) & (rt_sec_corrected < 0), 0.0,
+                       np.where((rt_sec_corrected >= 0) & (rt_sec_corrected <= 18000), rt_sec_corrected / 60.0, np.nan))
+    result['Response_Time_Mins'] = rt_mins
+    
+    result['Urban_SLA_Met'] = np.where(
+        (result['Location_Category'] == 'Urban') & 
+        (result['Response_Time_Mins'] >= 0) & 
+        (result['Response_Time_Mins'] <= 15), 1, 0
+    )
+    result['Rural_SLA_Met'] = np.where(
+        (result['Location_Category'] == 'Rural') & 
+        (result['Response_Time_Mins'] >= 0) & 
+        (result['Response_Time_Mins'] <= 30), 1, 0
+    )
+    result['Urban_ART_Met'] = np.where(
+        (result['Location_Category'] == 'Urban') & 
+        (result['Response_Time_Mins'] >= 0) & 
+        (result['Response_Time_Mins'] <= 25), 1, 0
+    )
+    result['Rural_ART_Met'] = np.where(
+        (result['Location_Category'] == 'Rural') & 
+        (result['Response_Time_Mins'] >= 0) & 
+        (result['Response_Time_Mins'] <= 40), 1, 0
+    )
 
     return result

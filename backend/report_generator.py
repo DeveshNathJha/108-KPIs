@@ -63,7 +63,7 @@ def categorize_disease(val):
 
 TYPO_CORRECTIONS = {
     "JH01FL0390": "JH01FL0396",
-    "JH01FL3802": "JH01FL3082"
+    "JH01FL3082": "JH01FL3802"
 }
 
 def clean_vehicle_number(val):
@@ -117,11 +117,19 @@ def _get_applicable_equipments(v_type):
 
 def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.DataFrame, calls_df: pd.DataFrame, hoto_only: bool = False) -> tuple[bytes, str]:
     """Core KPI report generator producing detailed vehicle, daily call, and district summary sheets."""
+    # Generate Case_ID in raw_df to guarantee robust matching and filtering
+    raw_df_copy = raw_df.copy()
+    sl_no = sql_engine._find_col(raw_df_copy, ['Sl No', 'Sl.No', 'Serial No', 'Sr No', 'SNo', 'S No'], pd.Series(index=raw_df_copy.index))
+    if sl_no is not None and not sl_no.isna().all():
+        raw_df_copy['Case_ID'] = sl_no.astype(str)
+    else:
+        raw_df_copy['Case_ID'] = [str(i) for i in range(len(raw_df_copy))]
+
     # Capture original master count before any filtering
     original_master_count = len(master_df)
     
     # Pre-calculate dates for HOTO filtering
-    temp_raw_dates = pd.to_datetime(raw_df['Date'], errors='coerce', dayfirst=True) if 'Date' in raw_df.columns else pd.Series(dtype='datetime64[ns]')
+    temp_raw_dates = pd.to_datetime(raw_df_copy['Date'], errors='coerce', dayfirst=False) if 'Date' in raw_df_copy.columns else pd.Series(dtype='datetime64[ns]')
     max_date = temp_raw_dates.max()
     min_date = temp_raw_dates.min()
     
@@ -160,8 +168,39 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
 
 
     
-    # 1. Run Correlation
-    corr_df = sql_engine.run_correlation(raw_df, calls_df)
+    # 1. Run Correlation on full data
+    corr_df = sql_engine.run_correlation(raw_df_copy, calls_df)
+    
+    # Create filtered version of raw trips for reporting (excl 0-distance and null-vehicle)
+    raw_filtered = raw_df_copy.copy()
+    if 'Vehicle No' in raw_filtered.columns:
+        raw_filtered = raw_filtered[
+            raw_filtered['Vehicle No'].notna() &
+            (raw_filtered['Vehicle No'].astype(str).str.strip() != '') &
+            (raw_filtered['Vehicle No'].astype(str).str.strip() != '\\N')
+        ].copy()
+    if 'Base Start ODO' in raw_filtered.columns and 'Base End ODO' in raw_filtered.columns:
+        start_odo = pd.to_numeric(raw_filtered['Base Start ODO'], errors='coerce')
+        end_odo = pd.to_numeric(raw_filtered['Base End ODO'], errors='coerce')
+        raw_filtered = raw_filtered[(end_odo - start_odo).fillna(0) != 0].copy()
+
+    valid_case_ids = set(raw_filtered['Case_ID'])
+    
+    # Update correlation calls matching excluded trips to Not Served
+    excluded_mask = corr_df['Case_ID'].notna() & ~corr_df['Case_ID'].isin(valid_case_ids)
+    corr_df.loc[excluded_mask, 'Case_ID'] = None
+    corr_df.loc[excluded_mask, 'Service_Status'] = 'Not Served'
+    corr_df.loc[excluded_mask, 'Response_Time_Mins'] = np.nan
+    corr_df.loc[excluded_mask, 'Urban_SLA_Met'] = 0
+    corr_df.loc[excluded_mask, 'Rural_SLA_Met'] = 0
+    corr_df.loc[excluded_mask, 'Urban_ART_Met'] = 0
+    corr_df.loc[excluded_mask, 'Rural_ART_Met'] = 0
+    corr_df.loc[excluded_mask, 'Scene_Arrival_Time'] = None
+    corr_df.loc[excluded_mask, 'Trip_Connected_Time'] = None
+    corr_df.loc[excluded_mask, 'Vehicle_No'] = None
+    corr_df.loc[excluded_mask, 'Clean_Vehicle_No'] = ''
+    
+    raw_df = raw_filtered
     
     hoto_col = None
     for col in master_df.columns:
@@ -265,7 +304,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     raw['Clean_Vehicle_No'] = raw['Vehicle No'].apply(clean_vehicle_number)
     
     # Date Range of dataset (already calculated above, just re-assigning for raw_df)
-    raw['Parsed_Date'] = pd.to_datetime(raw['Date'], errors='coerce', dayfirst=True)
+    raw['Parsed_Date'] = pd.to_datetime(raw['Date'], errors='coerce', dayfirst=False)
     all_dates = pd.date_range(start=min_date, end=max_date) if pd.notna(min_date) and pd.notna(max_date) else []
     total_days = max(len(all_dates), 1)
     
@@ -275,11 +314,13 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     raw['Trip_Distance'] = (raw['End_ODO'] - raw['Start_ODO']).fillna(0)
     
     raw_default = pd.Series(index=raw.index)
+    # Dispatch Time = assigned_time - Agrent CONNECTED TIME
+    # (time from when agent picked up the call to when ambulance was dispatched)
     parsed_assigned = sql_engine._parse_raw_datetime(raw, ['assigned_time', 'assigned time', 'assign time'], ['Date', 'date'], raw_default)
     parsed_connected = sql_engine._parse_raw_datetime(raw, ['Agrent CONNECTED TIME', 'Agent Connected Time', 'Connected Time', 'Connect Time'], ['Date', 'date'], raw_default)
     
-    dispatch_sec = (pd.to_datetime(parsed_assigned, errors='coerce', dayfirst=True) - 
-                    pd.to_datetime(parsed_connected, errors='coerce', dayfirst=True)).dt.total_seconds()
+    dispatch_sec = (pd.to_datetime(parsed_assigned, errors='coerce', dayfirst=False) - 
+                    pd.to_datetime(parsed_connected, errors='coerce', dayfirst=False)).dt.total_seconds()
     # Correct for midnight crossovers
     dispatch_sec = np.where(dispatch_sec < -43200, dispatch_sec + 86400, dispatch_sec)
     # Floor small negative lag to 0, filter out large outliers (>3 hours or still negative) as np.nan
@@ -394,16 +435,16 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
         # Base Row
         amb_row = {
             'District': district,
-            'Vehicle Number': row['Registration No.'],
+            'Vehicle Number': reg,
             'Vehicle Type': v_type,
             'Trips Count': trips,
             'Total Distance Travelled': round(dist, 1),
             'No Of Days (>3 Trips)': days_gt_3,
             'No of Days 0 Trips': days_zero,
-            'Average Dispatch Time': round(avg_disp, 1) if pd.notna(avg_disp) else 'N/A',
+            'Average Dispatch Time in Sec': round(avg_disp, 1) if pd.notna(avg_disp) else 'N/A',
             'Count of Trip > 180 Sec Dispatch Time': disp_gt_180,
-            'Average Response Time': round(avg_resp, 2) if pd.notna(avg_resp) else 'N/A',
-            'Total Delay in response time': round(delay_penalty_map.get(reg, 0.0), 2),
+            'Average Response Time in Min': round(avg_resp, 2) if pd.notna(avg_resp) else 'N/A',
+            'Total Delay in response time in Min': round(delay_penalty_map.get(reg, 0.0), 2),
             'Trips beyond Response Time(Rural)': rural_fail,
             'Trips beyond Response Time(Urban)': urban_fail,
             'Equipments Last Updated On': eq_update,
@@ -429,6 +470,48 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     raw['Parsed_Date_Str'] = raw['Parsed_Date'].dt.date
     trips_per_date = raw.groupby(['Parsed_Date_Str', 'Clean_Vehicle_No']).size().reset_index(name='trips')
     
+    # Pre-parse HOTO and Condemnation dates for master rows to avoid pd.to_datetime overhead in loops
+    master_hoto_condemn_info = []
+    master_clean_col = 'Registration No.'
+    for col in master.columns:
+        if 'registration' in str(col).lower() or 'reg' in str(col).lower():
+            master_clean_col = col
+            break
+
+    for idx, row in master.iterrows():
+        reg_clean = clean_vehicle_number(row.get(master_clean_col, ''))
+        hoto_val = row.get(hoto_col, row.get('HOTO Status', row.get('HOTO or not', '')))
+        is_hoto = False
+        hoto_dt = None
+        if str(hoto_val).strip().upper() in ('YES', 'HOTO', 'Y', 'TRUE'):
+            is_hoto = True
+        elif str(hoto_val).strip().upper() not in ('', 'NAN', 'NAT', 'NONE', 'NO', 'N/A', 'FALSE', 'N'):
+            try:
+                hoto_dt = pd.to_datetime(hoto_val, errors='coerce', dayfirst=True)
+                if pd.notna(hoto_dt):
+                    is_hoto = True
+                    hoto_dt = hoto_dt.tz_localize(None)
+            except Exception:
+                pass
+        
+        condemn_dt = None
+        if condemn_col:
+            condemn_val = row.get(condemn_col)
+            if pd.notna(condemn_val) and str(condemn_val).strip() not in ('', '-----', 'nan', 'None'):
+                try:
+                    condemn_dt = pd.to_datetime(str(condemn_val).strip(), errors='coerce', dayfirst=True)
+                    if pd.notna(condemn_dt):
+                        condemn_dt = condemn_dt.tz_localize(None)
+                except Exception:
+                    pass
+        
+        master_hoto_condemn_info.append({
+            'clean_reg': reg_clean,
+            'is_hoto': is_hoto,
+            'hoto_dt': hoto_dt,
+            'condemn_dt': condemn_dt
+        })
+    
     # Group Correlated Calls by Date
     corr_df['Parsed_Date'] = pd.to_datetime(corr_df['Call_Start_Time']).dt.date
     daily_grp = corr_df.groupby('Parsed_Date')
@@ -436,51 +519,41 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     for date, group in daily_grp:
         # S.N. 4 Logic
         valid_fleet_count = 0
-        date_tz_none = pd.to_datetime(date)
+        date_tz_none = pd.to_datetime(date).tz_localize(None)
         
-        for idx, row in master.iterrows():
-            # Check HOTO
-            hoto_val = row.get(hoto_col, row.get('HOTO Status', row.get('HOTO or not', '')))
-            is_hoto = False
-            hoto_dt = None
-            if str(hoto_val).strip().upper() in ('YES', 'HOTO', 'Y', 'TRUE'):
-                is_hoto = True
-            elif str(hoto_val).strip().upper() not in ('', 'NAN', 'NAT', 'NONE', 'NO', 'N/A', 'FALSE', 'N'):
-                try:
-                    hoto_dt = pd.to_datetime(hoto_val, errors='coerce', dayfirst=True)
-                    if pd.notna(hoto_dt):
-                        is_hoto = True
-                except Exception:
-                    pass
-                    
-            if not is_hoto:
+        for info in master_hoto_condemn_info:
+            if not info['is_hoto']:
                 continue
                 
-            if pd.notna(hoto_dt):
-                if hoto_dt.tz_localize(None) > date_tz_none:
+            if info['hoto_dt'] is not None:
+                if info['hoto_dt'] > date_tz_none:
                     continue # Not yet in fleet
                     
-            # Check Condemnation / Damage
-            if condemn_col:
-                condemn_val = row.get(condemn_col)
-                if pd.notna(condemn_val) and str(condemn_val).strip() not in ('', '-----', 'nan', 'None'):
-                    try:
-                        condemn_dt = pd.to_datetime(str(condemn_val).strip(), errors='coerce', dayfirst=True)
-                        if pd.notna(condemn_dt):
-                            if condemn_dt.tz_localize(None) <= date_tz_none:
-                                continue # Already retired on this date
-                    except Exception:
-                        pass
+            if info['condemn_dt'] is not None:
+                if info['condemn_dt'] <= date_tz_none:
+                    continue # Already retired on this date
                         
             valid_fleet_count += 1
             
-        # Operational count on this date
+        # Operational count on this date (only counting active HOTO vehicles)
+        active_hoto_on_date = set()
+        for info in master_hoto_condemn_info:
+            if not info['is_hoto']:
+                continue
+            if info['hoto_dt'] is not None and info['hoto_dt'] > date_tz_none:
+                continue
+            if info['condemn_dt'] is not None and info['condemn_dt'] <= date_tz_none:
+                continue
+            if info['clean_reg']:
+                active_hoto_on_date.add(info['clean_reg'])
+
         op_vehicles = trips_per_date[(trips_per_date['Parsed_Date_Str'] == date) & (trips_per_date['trips'] > 0)]
-        op_count = op_vehicles['Clean_Vehicle_No'].nunique()
+        op_count = op_vehicles[op_vehicles['Clean_Vehicle_No'].isin(active_hoto_on_date)]['Clean_Vehicle_No'].nunique()
         op_pct = (op_count / valid_fleet_count * 100) if valid_fleet_count > 0 else 100.0
 
         tot_calls = group['Call_ID'].nunique()
         avg_pickup = group['Call_Pickup_Time_Sec'].mean()
+        # Total Calls Attended = calls where Service_Status == 'Served' (matched to a real trip)
         tot_attended = (group['Service_Status'] == 'Served').sum()
         
         urban_sla = group['Urban_SLA_Met'].sum()
@@ -500,9 +573,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
             'Operational fleet < 95%': 'YES' if op_pct < 95.0 else 'NO',
             'Total Calls': tot_calls,
             'Avg Call Pickup Time (Sec)': round(avg_pickup, 1) if pd.notna(avg_pickup) else 0,
-            'Total Calls Attended': tot_attended,
-            'Calls Attended within 25 mins (Urban ART Met)': urban_art,
-            'Calls Attended within 40 mins (Rural ART Met)': rural_art
+            'Total Calls Attended': tot_attended
         }
         
         # Add Disease Categories Columns
@@ -529,15 +600,18 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
             urban_g = g_dist[g_dist['Location_Category'] == 'Urban']
             rural_g = g_dist[g_dist['Location_Category'] == 'Rural']
             
-            u_sla_tot = len(urban_g)
-            u_sla_met = urban_g['Urban_SLA_Met'].sum() if 'Urban_SLA_Met' in urban_g.columns else 0
-            r_sla_tot = len(rural_g)
-            r_sla_met = rural_g['Rural_SLA_Met'].sum() if 'Rural_SLA_Met' in rural_g.columns else 0
+            urban_valid = urban_g[urban_g['Response_Time_Mins'].notna() & (urban_g['Response_Time_Mins'] >= 0)]
+            rural_valid = rural_g[rural_g['Response_Time_Mins'].notna() & (rural_g['Response_Time_Mins'] >= 0)]
             
-            u_art_tot = len(urban_g)
-            u_art_met = urban_g['Urban_ART_Met'].sum() if 'Urban_ART_Met' in urban_g.columns else 0
-            r_art_tot = len(rural_g)
-            r_art_met = rural_g['Rural_ART_Met'].sum() if 'Rural_ART_Met' in rural_g.columns else 0
+            u_sla_tot = len(urban_valid)
+            u_sla_met = urban_valid['Urban_SLA_Met'].sum() if 'Urban_SLA_Met' in urban_valid.columns else 0
+            r_sla_tot = len(rural_valid)
+            r_sla_met = rural_valid['Rural_SLA_Met'].sum() if 'Rural_SLA_Met' in rural_valid.columns else 0
+            
+            u_art_tot = len(urban_valid)
+            u_art_met = urban_valid['Urban_ART_Met'].sum() if 'Urban_ART_Met' in urban_valid.columns else 0
+            r_art_tot = len(rural_valid)
+            r_art_met = rural_valid['Rural_ART_Met'].sum() if 'Rural_ART_Met' in rural_valid.columns else 0
             
             dist_sla_map[clean_d] = {
                 'urban_sla': f"{round((u_sla_met / max(u_sla_tot, 1) * 100), 2)}% ({u_sla_met}/{u_sla_tot})" if u_sla_tot > 0 else "N/A",
@@ -571,7 +645,7 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
                 status.append("Excess Distance (>120km)")
                 
             status_str = ", ".join(status) if status else "Target Met"
-            resp_m = pd.to_numeric(group['Average Response Time'], errors='coerce')
+            resp_m = pd.to_numeric(group['Average Response Time in Min'], errors='coerce')
             avg_resp = resp_m.dropna().mean()
             
             high_risk = group['Equipment Risk Level'].str.contains('High Risk', na=False).sum()
@@ -633,13 +707,13 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     rural_art_met = 0
     
     if 'Location_Category' in corr_df.columns and 'Urban_SLA_Met' in corr_df.columns and 'Rural_SLA_Met' in corr_df.columns:
-        urban_df = corr_df[corr_df['Location_Category'] == 'Urban']
+        urban_df = corr_df[(corr_df['Location_Category'] == 'Urban') & corr_df['Response_Time_Mins'].notna() & (corr_df['Response_Time_Mins'] >= 0)]
         urban_total = len(urban_df)
         urban_met = urban_df['Urban_SLA_Met'].sum()
         urban_art_total = len(urban_df)
         urban_art_met = urban_df['Urban_ART_Met'].sum()
         
-        rural_df = corr_df[corr_df['Location_Category'] == 'Rural']
+        rural_df = corr_df[(corr_df['Location_Category'] == 'Rural') & corr_df['Response_Time_Mins'].notna() & (corr_df['Response_Time_Mins'] >= 0)]
         rural_total = len(rural_df)
         rural_met = rural_df['Rural_SLA_Met'].sum()
         rural_art_total = len(rural_df)
@@ -658,9 +732,17 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
     # Calculate Equipment Quality Adherence
     eq_audited_count = len(eq_dict)
     eq_low_risk_count = 0
+    
+    # Pre-build vehicle type lookup dictionary for O(1) matching
+    veh_type_dict = {}
+    for idx, row in master.iterrows():
+        reg = row['Clean_Vehicle_No']
+        if reg:
+            v_type = row.get('Type of Vehicle', row.get('Vehicle Type', 'BLS'))
+            veh_type_dict[reg] = v_type
+            
     for reg, eq_audit in eq_dict.items():
-        row_master = master[master['Clean_Vehicle_No'] == reg]
-        v_type = row_master.iloc[0].get('Type of Vehicle', 'BLS') if not row_master.empty else 'BLS'
+        v_type = veh_type_dict.get(reg, 'BLS')
         applicable = _get_applicable_equipments(v_type)
         working = 0
         for item in applicable:
@@ -684,42 +766,140 @@ def generate_excel(master_df: pd.DataFrame, raw_df: pd.DataFrame, eq_df: pd.Data
         gps_total = master_df[hoto_mask]['GPS'].astype(str).str.upper().str.strip().isin(['YES', 'Y']).sum()
     gps_pct = f"{round((gps_total / max(total_fleet, 1) * 100), 1)}% ({gps_total}/{total_fleet})" if total_fleet > 0 else "N/A"
     
+    # Calculate new Summary sheet parameters:
+    # 1. Average Call Pickup Time (Sec): (IVR Duration + QUEUE Duration + RING Duration) / count where sum > 0
+    ivr_sec = sql_engine._parse_duration(sql_engine._find_col(calls_df, ['IVR Duration', 'IVR Time'], pd.Series(0.0, index=calls_df.index)))
+    queue_sec = sql_engine._parse_duration(sql_engine._find_col(calls_df, ['QUEUE Duration', 'QUEUE Time'], pd.Series(0.0, index=calls_df.index)))
+    ring_sec = sql_engine._parse_duration(sql_engine._find_col(calls_df, ['RING Duration', 'RING Time'], pd.Series(0.0, index=calls_df.index)))
+    
+    total_pickup_sec = ivr_sec + queue_sec + ring_sec
+    non_zero_pickups = total_pickup_sec[total_pickup_sec > 0]
+    avg_call_pickup = non_zero_pickups.mean() if len(non_zero_pickups) > 0 else 0.0
+    
+    # 2. Count of calls pickup beyond 30 sec
+    beyond_30_count = (total_pickup_sec > 30).sum()
+    
+    # 3. Monthly call categorization percentages
+    total_calls_count = len(calls_df)
+    if total_calls_count > 0:
+        agent_disp = calls_df['Agent Disposition'].astype(str).str.strip()
+        dialer_disp = calls_df['Dialer Disposition'].astype(str).str.strip()
+        
+        def _normalize_disp(s: pd.Series) -> pd.Series:
+            return s.str.replace(' ', '', regex=False).str.replace('-', '', regex=False)
+
+        agent_disp_norm  = _normalize_disp(agent_disp)
+        dialer_disp_norm = _normalize_disp(dialer_disp)
+
+        final_disp = np.where(
+            agent_disp.isin(['', '---', '\\N', 'nan', 'NaN', 'None', None]),
+            dialer_disp_norm,
+            agent_disp_norm
+        )
+
+        eligible_vals = {
+            'EmergencyCall', 'InterFacilityTransfer', 'NonEmergencyCall',
+            'InterState', 'CriticalCare', 'Neonatal', 'EMTToERO',
+        }
+        is_eligible = pd.Series(final_disp).isin(eligible_vals) | (dialer_disp_norm == 'COMPLETED')
+        valid_mask = is_eligible.values
+
+        agent_lower = agent_disp_norm.str.lower()
+        dialer_lower = dialer_disp_norm.str.lower()
+
+        cat = np.full(total_calls_count, 'Unclassified', dtype=object)
+        cat[valid_mask] = 'Valid'
+        
+        dropped_mask = (cat == 'Unclassified') & agent_lower.str.contains('dropped|drop', na=False)
+        cat[dropped_mask] = 'Dropped'
+        
+        missed_mask = (cat == 'Unclassified') & (agent_lower.str.contains('missed', na=False) | (dialer_lower == 'missed'))
+        cat[missed_mask] = 'Missed'
+        
+        silent_mask = (cat == 'Unclassified') & agent_lower.str.contains('silent', na=False)
+        cat[silent_mask] = 'Silent'
+        
+        noise_mask = (cat == 'Unclassified') & agent_lower.str.contains('nuisance|prank|wrong|pranck', na=False)
+        cat[noise_mask] = 'Noise/Disturbance'
+        
+        abandoned_mask = (cat == 'Unclassified') & (dialer_lower == 'abandoned')
+        cat[abandoned_mask] = 'Abandoned (Non-Penalty)'
+        
+        incomplete_mask = (cat == 'Unclassified')
+        cat[incomplete_mask] = 'Incomplete'
+        
+        pct_dropped = (cat == 'Dropped').sum() / total_calls_count * 100
+        pct_missed = (cat == 'Missed').sum() / total_calls_count * 100
+        pct_silent = (cat == 'Silent').sum() / total_calls_count * 100
+        pct_abandoned = (cat == 'Abandoned (Non-Penalty)').sum() / total_calls_count * 100
+        pct_valid = (cat == 'Valid').sum() / total_calls_count * 100
+        pct_incomplete = (cat == 'Incomplete').sum() / total_calls_count * 100
+        pct_noise = (cat == 'Noise/Disturbance').sum() / total_calls_count * 100
+    else:
+        pct_dropped = pct_missed = pct_silent = pct_abandoned = pct_valid = pct_incomplete = pct_noise = 0.0
+
+    # 4. Total Average Handling Time (AHT) per Call
+    avg_aht = corr_df['AHT_Secs'].mean() if 'AHT_Secs' in corr_df.columns else np.nan
+    avg_aht_str = f"{round(avg_aht, 1)} Secs" if pd.notna(avg_aht) else "N/A"
+    
     summary_rows = [
         {"KPI Report Parameter": "Summary Report", "Value / Metric": ""},
+        {"KPI Report Parameter": "KPI Report Parameter", "Value / Metric": "Value / Metric"},
         {"KPI Report Parameter": "Report Generation Time", "Value / Metric": report_gen_date},
         {"KPI Report Parameter": "Reporting Date Range", "Value / Metric": period_str},
         {"KPI Report Parameter": "", "Value / Metric": ""},
+        
         {"KPI Report Parameter": "Operational Statistics Summary", "Value / Metric": ""},
-        {"KPI Report Parameter": "Total Vehicles in Master Database", "Value / Metric": original_master_count},
-        {"KPI Report Parameter": "Registered Handed Over Fleet (HOTO)", "Value / Metric": total_fleet},
-        {"KPI Report Parameter": "Active Fleet Size (Ambulances with trips)", "Value / Metric": active_fleet},
-        {"KPI Report Parameter": "Total Ambulance Trips Completed", "Value / Metric": total_trips},
-        {"KPI Report Parameter": "Total Operational Distance Travelled (Km)", "Value / Metric": round(total_dist, 1)},
+        {"KPI Report Parameter": "Total Vehicles", "Value / Metric": original_master_count},
+        {"KPI Report Parameter": "Handed Over Fleet (HOTO)", "Value / Metric": total_fleet},
+        {"KPI Report Parameter": "Active Ambulances (Ambulances with trips)", "Value / Metric": active_fleet},
+        {"KPI Report Parameter": "Total Trips Completed", "Value / Metric": total_trips},
+        {"KPI Report Parameter": "Total Distance Travelled (Km)", "Value / Metric": round(total_dist, 1)},
         {"KPI Report Parameter": "", "Value / Metric": ""},
+        
+        {"KPI Report Parameter": "Call Center & IVR Performance", "Value / Metric": ""},
+        {"KPI Report Parameter": "Average Call Pickup Time (Sec)", "Value / Metric": round(avg_call_pickup, 1)},
+        {"KPI Report Parameter": "Calls Pickup Beyond 30 Sec", "Value / Metric": f"{beyond_30_count} calls"},
+        {"KPI Report Parameter": "", "Value / Metric": ""},
+
+        {"KPI Report Parameter": "Call Outcome Breakdown (Monthly)", "Value / Metric": ""},
+        {"KPI Report Parameter": "Valid Calls %", "Value / Metric": f"{round(pct_valid, 2)}% ({(cat == 'Valid').sum()}/{total_calls_count})"},
+        {"KPI Report Parameter": "Dropped Calls %", "Value / Metric": f"{round(pct_dropped, 2)}% ({(cat == 'Dropped').sum()}/{total_calls_count})"},
+        {"KPI Report Parameter": "Missed Calls %", "Value / Metric": f"{round(pct_missed, 2)}% ({(cat == 'Missed').sum()}/{total_calls_count})"},
+        {"KPI Report Parameter": "Silent Calls %", "Value / Metric": f"{round(pct_silent, 2)}% ({(cat == 'Silent').sum()}/{total_calls_count})"},
+        {"KPI Report Parameter": "Abandoned Calls  %", "Value / Metric": f"{round(pct_abandoned, 2)}% ({(cat == 'Abandoned (Non-Penalty)').sum()}/{total_calls_count})"},
+        {"KPI Report Parameter": "Incomplete Calls %", "Value / Metric": f"{round(pct_incomplete, 2)}% ({(cat == 'Incomplete').sum()}/{total_calls_count})"},
+        {"KPI Report Parameter": "Noise/Disturbance Calls %", "Value / Metric": f"{round(pct_noise, 2)}% ({(cat == 'Noise/Disturbance').sum()}/{total_calls_count})"},
+        {"KPI Report Parameter": "", "Value / Metric": ""},
+
         {"KPI Report Parameter": "Performance & SLA Compliance", "Value / Metric": ""},
         {"KPI Report Parameter": "Average Response Time (Mins)", "Value / Metric": round(avg_response_time, 2) if pd.notna(avg_response_time) else "N/A"},
         {"KPI Report Parameter": "Urban ART Compliance (<=25 mins)", "Value / Metric": urban_art_pct},
         {"KPI Report Parameter": "Rural ART Compliance (<=40 mins)", "Value / Metric": rural_art_pct},
         {"KPI Report Parameter": "Ambulance Dispatch Compliance (<=180s)", "Value / Metric": dispatch_sla_pct},
         {"KPI Report Parameter": "", "Value / Metric": ""},
+        
         {"KPI Report Parameter": "SLA & Operational Insights", "Value / Metric": ""},
         {"KPI Report Parameter": "Total Days with Operational fleet < 95%", "Value / Metric": (daily_df['Operational fleet < 95%'] == 'YES').sum() if not daily_df.empty else 0},
-        {"KPI Report Parameter": "Total Fleet Delay in response time (Mins)", "Value / Metric": round(amb_df['Total Delay in response time'].sum(), 1) if not amb_df.empty else 0},
+        {"KPI Report Parameter": "Total Fleet Delay in response time (Mins)", "Value / Metric": round(amb_df['Total Delay in response time in Min'].sum(), 1) if not amb_df.empty else 0},
         {"KPI Report Parameter": "Districts with Shortfall in Trips", "Value / Metric": (dist_df['Excess / Shortfall Status'].str.contains('Shortfall in Trips', na=False)).sum() if not dist_df.empty else 0},
         {"KPI Report Parameter": "Districts with Shortfall in Distance", "Value / Metric": (dist_df['Excess / Shortfall Status'].str.contains('Shortfall in Distance', na=False)).sum() if not dist_df.empty else 0},
         {"KPI Report Parameter": "", "Value / Metric": ""},
+        
         {"KPI Report Parameter": "Equipment Quality & Asset Audits", "Value / Metric": ""},
         {"KPI Report Parameter": "Total Equipments Audited Vehicles", "Value / Metric": eq_audited_count},
         {"KPI Report Parameter": "Equipment Quality Adherence (Health >= 90%)", "Value / Metric": eq_adherence_pct},
         {"KPI Report Parameter": "High-Risk Ambulances (Equipment health < 70%)", "Value / Metric": high_risk_count},
         {"KPI Report Parameter": "Total GPS Installed Fleet", "Value / Metric": gps_pct},
+        {"KPI Report Parameter": "", "Value / Metric": ""},
+        {"KPI Report Parameter": "Total Average Handling Time (AHT) per Call", "Value / Metric": avg_aht_str},
     ]
     summary_df = pd.DataFrame(summary_rows)
     
     # 6. Save all Sheets to Excel
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        summary_df.to_excel(writer, sheet_name='Summary', index=False)
+        summary_df.to_excel(writer, sheet_name='Summary', index=False, header=False)
         amb_df.to_excel(writer, sheet_name='Ambulances', index=False)
         if not daily_df.empty:
             daily_df.to_excel(writer, sheet_name='Calc_Data', index=False)
