@@ -40,7 +40,7 @@ async def generate_report(
         
         def read_excel_smart(file_bytes, filename, candidates):
             if filename and filename.lower().endswith('.csv'):
-                return pd.read_csv(io.BytesIO(file_bytes))
+                return pd.read_csv(io.BytesIO(file_bytes), low_memory=False)
             try:
                 engine = 'openpyxl' if (filename and filename.lower().endswith('.xlsx')) else 'xlrd' if (filename and filename.lower().endswith('.xls')) else None
                 xl = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)

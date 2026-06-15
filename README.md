@@ -25,7 +25,7 @@ The project has been architected for high-speed calculation using an **In-Memory
 - **`backend/main.py`**: The FastAPI server. Exposes the `/api/generate-report` endpoint to ingest all 4 files, orchestrate calculations, and serve the styled Excel output.
 - **`backend/static/index.html`**: A premium glassmorphism Web UI serving as the control hub for upload, processing, and download of HOTO and Full reports.
 - **`kpi_dashboard.py`**: A Streamlit frontend providing interactive dashboard charts, date filtering, and live scorecard metrics.
-- **`sql_engine.py`**: The core correlation engine. Executes high-speed probabilistic SQL matching (using phone + time proximity) inside an in-memory SQLite database.
+- **`sql_engine.py`**: The core correlation engine. Executes high-speed probabilistic SQL matching (using vehicle registration numbers and phone numbers + time proximity) inside an in-memory SQLite database.
 - **`backend/report_generator.py`**: The Excel report builder. Applies deep sanitization filters, calculates equipment health risk indices, and renders multiple dashboard sheets.
 - **`query.sql`**: A standalone SQL file containing the query blueprints for manual execution and review. 
 
@@ -33,18 +33,21 @@ The project has been architected for high-speed calculation using an **In-Memory
 
 The correlation engine performs the following key steps:
 
-1. **Normalization**: Phone numbers are stripped of spaces to last 10 digits. Dispositions like "Silent Call" and "SilentCall" are merged. Blank/NULL districts are mapped to 'Unknown', and "Other" or "other" districts are also normalized.
-2. **Proximity Matching**: A call and a trip are matched if they share the same phone number AND the time difference is **within ±90 minutes**.
-3. **Trip Deduplication**: If multiple calls match the same Trip ID, only the closest call gets the trip. The rest are marked as 'Not Served' (prevents inflating the Service Coverage %).
-4. **District Backfilling**: To accurately distribute missed calls, the script backfills missing districts in the Call Hits file by looking up the known district history of the caller's phone number, or prioritizing the actual dispatch location (`Trip_District`) if a trip occurred.
-5. **Ranking & SLA**: SLA flags are computed based on Location Category (Urban ≤15 mins, Rural ≤30 mins) and P90 response times are calculated.
+1. **Normalization**: Phone numbers are stripped of spaces to the last 10 digits. Dispositions like "Silent Call" and "SilentCall" are merged. Blank/NULL districts are mapped to 'Unknown', and "Other" or "other" districts are also normalized. Cleaned vehicle registration numbers are created for both calls (`Call_Vehicle_No`) and raw trips (`Clean_Vehicle_No`) to form the primary correlation key.
+2. **Dual-Key Matching**: 
+   - *Primary Key*: Matches call and trip records using the cleaned vehicle registration number (`Call_Vehicle_No = Clean_Vehicle_No`) within a **±90-minute time window** between call start and trip connection.
+   - *Fallback Key*: If the call lacks a vehicle registration, it falls back to matching phone numbers (`Clean_Phone = Trip_Clean_Phone`) within the same **±90-minute window**.
+3. **Deduplication & Case ID Resolution**: In the raw CSV data, the `Case ID` column contains a generic year prefix (`20260000000000`) for all trips. Using it as a partition key would cause trips to collapse. The correlation engine uses the unique serial number column (`Sl No` / row index) as the unique trip identifier (`Case_ID`) for rank sorting and deduplication.
+4. **Trip Deduplication**: If multiple calls match the same Trip ID, only the closest call gets the trip. The rest are marked as 'Not Served' (prevents inflating the Service Coverage %).
+5. **District Backfilling**: To accurately distribute missed calls, the script backfills missing districts in the Call Hits file by looking up the known district history of the caller's phone number, or prioritizing the actual dispatch location (`Trip_District`) if a trip occurred.
+6. **Ranking & SLA**: SLA flags are computed based on Location Category (Urban ≤15 mins, Rural ≤30 mins) and P90 response times are calculated.
 
 ## 4. Key Performance Indicators (KPIs)
 
 - **Total Calls / Served Calls**: Overall volume.
 - **Eligible Conversion %**: (Eligible Calls Served / Total Eligible Calls) * 100
 - **Emergency Conversion %**: (Emergency Calls Served / Total Emergency Calls) * 100 - A stricter metric focusing only on high-risk cases.
-- **Avg Response Time (ART)**: Average time from Call Center connection to Scene Arrival.
+- **Avg Response Time (ART)**: Average time from Call Center connection (`Agent CONNECTED TIME`) to Scene Arrival (`scene_arrival_time`).
 - **P90 Response Time**: The time within which 90% of all trips arrive. This is the worst-case scenario metric.
 - **Genuine Emergency %**: Percentage of calls related to actual emergencies.
 - **Case Type Distribution**: Medical conditions are mapped from 44 raw text values into 10 clean clinical categories (e.g., Maternal, Trauma, Cardiac/Stroke).
@@ -65,7 +68,7 @@ streamlit run kpi_dashboard.py
 **Data Upload Requirements:**
 You upload four core files (in `.xlsx` or `.csv` format):
 1. **Master Data** (Must contain: `Registration No.` / `Registration No`, `GPS`, `HOTO Status` / `HOTO or not`, `Operational / Non-Operational`, `Type of Vehicle`)
-2. **Raw Trips Data** (Must contain: `Date`, `Agrent CONNECTED TIME`, `assigned_time`, `scene_arrival_time`, `Location Type`, `DISEASE`, `District` / `Distict`, `CALLER NO`, `Vehicle No`, `Case ID`, `Base Start ODO`, `Base End ODO`)
+2. **Raw Trips Data** (Must contain: `Date`, `Agrent CONNECTED TIME` [representing Agent Connected Time], `assigned_time`, `scene_arrival_time`, `Location Type`, `DISEASE`, `District` / `Distict`, `CALLER NO`, `Vehicle No`, `Case ID`, `Base Start ODO`, `Base End ODO`)
 3. **Equipments Audit** (Must contain: `VEHICLE NUMBER` and individual column headers for each standard medical equipment, e.g., `Cervical Collar`, `Pulse Oximeter`, `Suction Machine (Electric)`)
 4. **Call Hits Log** (Must contain: `Call Start Time`, `Agent Disposition` / `Dialer Disposition`, `District`, `Phone Number`, `Call Connect Time`, `Call End Time`, `QUEUE Duration`, `RING Duration`)
 
